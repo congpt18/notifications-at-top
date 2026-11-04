@@ -1,7 +1,5 @@
 using System;
-using System.Windows.Forms;
 using System.Runtime.InteropServices;
-using System.Drawing;
 using System.Threading;
 using System.Collections.Generic;
 using System.IO;
@@ -32,10 +30,18 @@ public class Program {
         public int Y;
     }
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr hWndChildAfter, string className, string windowTitle);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowPos")]
@@ -55,6 +61,20 @@ public class Program {
 
     [DllImport("user32.dll")]
     static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("kernel32.dll")]
+    static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    const uint MONITOR_DEFAULTTONEAREST = 2;
 
     const int VK_LBUTTON = 0x01;
     const int VK_RBUTTON = 0x02;
@@ -204,6 +224,32 @@ public class Program {
     }
     #endregion
 
+    /// <summary>
+    /// Reduces process working set to reclaim physical RAM to OS.
+    /// </summary>
+    public static void TrimWorkingSet() {
+        try {
+            SetProcessWorkingSetSize(GetCurrentProcess(), (IntPtr)(-1), (IntPtr)(-1));
+        } catch {
+            // Suppress memory trimming errors
+        }
+    }
+
+    /// <summary>
+    /// Retrieves monitor bounding rectangle for a window handle without allocating WinForms objects.
+    /// </summary>
+    private static RECT GetMonitorRect(IntPtr hwnd) {
+        IntPtr hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (hMonitor != IntPtr.Zero) {
+            MONITORINFO mi = new MONITORINFO();
+            mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+            if (GetMonitorInfo(hMonitor, ref mi)) {
+                return mi.rcMonitor;
+            }
+        }
+        return new RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+    }
+
     private static bool IsPointInRect(POINT pt, RECT rect) {
         return pt.X >= rect.Left && pt.X <= rect.Right && pt.Y >= rect.Top && pt.Y <= rect.Bottom;
     }
@@ -230,27 +276,27 @@ public class Program {
             return false;
         }
 
-        Screen screen = Screen.FromHandle(hwnd);
+        RECT screen = GetMonitorRect(hwnd);
         int targetX;
         int targetY;
 
         if (hasCustom) {
-            targetX = screen.Bounds.Left + customX;
-            targetY = screen.Bounds.Top + customY;
+            targetX = screen.Left + customX;
+            targetY = screen.Top + customY;
         } else {
             switch (position) {
                 case NotificationPosition.TopLeft:
-                    targetX = screen.Bounds.Left + xPadding;
+                    targetX = screen.Left + xPadding;
                     break;
                 case NotificationPosition.TopCenter:
-                    targetX = screen.Bounds.Left + (screen.Bounds.Width - width) / 2;
+                    targetX = screen.Left + (screen.Width - width) / 2;
                     break;
                 case NotificationPosition.TopRight:
                 default:
-                    targetX = screen.Bounds.Right - width - xPadding;
+                    targetX = screen.Right - width - xPadding;
                     break;
             }
-            targetY = screen.Bounds.Top + yOffset;
+            targetY = screen.Top + yOffset;
         }
 
         SetWindowPos(hwnd, IntPtr.Zero, targetX, targetY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
@@ -293,11 +339,15 @@ public class Program {
             int customOffsetY = 0;
             bool hasCustomPos = LoadPosition(position, out customOffsetX, out customOffsetY);
 
+            // Reclaim initialization memory footprint to OS
+            TrimWorkingSet();
+
             // Drag state variables
             bool isDragging = false;
             IntPtr draggingHwnd = IntPtr.Zero;
             POINT dragStartCursor = new POINT();
             POINT dragStartWindow = new POINT();
+            bool wasActiveNotification = false;
 
             while (true) {
                 bool hasActiveNotification = false;
@@ -386,9 +436,9 @@ public class Program {
                         if (IsWindow(draggingHwnd)) {
                             RECT finalRect = new RECT();
                             if (GetWindowRect(draggingHwnd, ref finalRect)) {
-                                Screen screen = Screen.FromHandle(draggingHwnd);
-                                customOffsetX = finalRect.Left - screen.Bounds.Left;
-                                customOffsetY = finalRect.Top - screen.Bounds.Top;
+                                RECT screen = GetMonitorRect(draggingHwnd);
+                                customOffsetX = finalRect.Left - screen.Left;
+                                customOffsetY = finalRect.Top - screen.Top;
                                 hasCustomPos = true;
                                 SavePosition(position, customOffsetX, customOffsetY);
                             }
@@ -404,8 +454,14 @@ public class Program {
                     }
                 }
 
-                // Adaptive polling: 10ms during drag, 15ms during active display, 100ms when idle
-                Thread.Sleep(isDragging ? 10 : (hasActiveNotification ? 15 : 100));
+                // Trim working set when active notification dismisses to keep memory footprint minimal
+                if (wasActiveNotification && !hasActiveNotification && !isDragging) {
+                    TrimWorkingSet();
+                }
+                wasActiveNotification = hasActiveNotification;
+
+                // Adaptive polling: 10ms during drag, 15ms during active display, 250ms when idle
+                Thread.Sleep(isDragging ? 10 : (hasActiveNotification ? 15 : 250));
             }
         }
     }
