@@ -3,6 +3,9 @@ using System.Windows.Forms;
 using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Threading;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
 
 public enum NotificationPosition {
     TopLeft,
@@ -23,6 +26,12 @@ public class Program {
         public int Height { get { return Bottom - Top; } }
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT {
+        public int X;
+        public int Y;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
@@ -41,6 +50,16 @@ public class Program {
     [DllImport("user32.dll")]
     static extern bool SetProcessDPIAware();
 
+    [DllImport("user32.dll")]
+    static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
+    static extern bool GetCursorPos(out POINT lpPoint);
+
+    const int VK_LBUTTON = 0x01;
+    const int VK_RBUTTON = 0x02;
+    const int VK_MENU = 0x12; // Alt key
+
     const short SWP_NOSIZE = 1;
     const short SWP_NOZORDER = 0x0004;
     const int SWP_SHOWWINDOW = 0x0040;
@@ -48,11 +67,152 @@ public class Program {
 
     public static int Cooldown = 0;
 
+    #region Config Management
+    public static string GetConfigPath() {
+        try {
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
+        } catch {
+            string appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NotificationsAtTop");
+            if (!Directory.Exists(appData)) {
+                Directory.CreateDirectory(appData);
+            }
+            return Path.Combine(appData, "config.ini");
+        }
+    }
+
+    public static bool LoadPosition(NotificationPosition position, out int customX, out int customY) {
+        customX = 0;
+        customY = 0;
+        string path = GetConfigPath();
+        if (!File.Exists(path)) return false;
+
+        try {
+            string[] lines = File.ReadAllLines(path);
+            string currentSection = "";
+            string targetSection = "[" + position.ToString() + "]";
+            bool isCustom = false;
+            int x = 0, y = 0;
+
+            foreach (string rawLine in lines) {
+                string line = rawLine.Trim();
+                if (line.StartsWith("[") && line.EndsWith("]")) {
+                    currentSection = line;
+                    continue;
+                }
+                if (string.Equals(currentSection, targetSection, StringComparison.OrdinalIgnoreCase)) {
+                    int eqIndex = line.IndexOf('=');
+                    if (eqIndex > 0) {
+                        string key = line.Substring(0, eqIndex).Trim();
+                        string val = line.Substring(eqIndex + 1).Trim();
+                        if (string.Equals(key, "Custom", StringComparison.OrdinalIgnoreCase)) {
+                            isCustom = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase);
+                        } else if (string.Equals(key, "X", StringComparison.OrdinalIgnoreCase)) {
+                            int.TryParse(val, out x);
+                        } else if (string.Equals(key, "Y", StringComparison.OrdinalIgnoreCase)) {
+                            int.TryParse(val, out y);
+                        }
+                    }
+                }
+            }
+
+            if (isCustom) {
+                customX = x;
+                customY = y;
+                return true;
+            }
+        } catch {
+            // Ignore file read exceptions
+        }
+
+        return false;
+    }
+
+    public static void SavePosition(NotificationPosition position, int customX, int customY) {
+        try {
+            string path = GetConfigPath();
+            Dictionary<string, Dictionary<string, string>> ini = 
+                new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+            if (File.Exists(path)) {
+                string[] lines = File.ReadAllLines(path);
+                string currentSection = "";
+                foreach (string rawLine in lines) {
+                    string line = rawLine.Trim();
+                    if (line.StartsWith("[") && line.EndsWith("]")) {
+                        currentSection = line.Substring(1, line.Length - 2);
+                        if (!ini.ContainsKey(currentSection)) {
+                            ini[currentSection] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        }
+                        continue;
+                    }
+                    int eq = line.IndexOf('=');
+                    if (eq > 0 && !string.IsNullOrEmpty(currentSection)) {
+                        string k = line.Substring(0, eq).Trim();
+                        string v = line.Substring(eq + 1).Trim();
+                        ini[currentSection][k] = v;
+                    }
+                }
+            }
+
+            string sec = position.ToString();
+            if (!ini.ContainsKey(sec)) {
+                ini[sec] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            }
+            ini[sec]["Custom"] = "true";
+            ini[sec]["X"] = customX.ToString();
+            ini[sec]["Y"] = customY.ToString();
+
+            StringBuilder sb = new StringBuilder();
+            foreach (KeyValuePair<string, Dictionary<string, string>> secPair in ini) {
+                sb.AppendLine("[" + secPair.Key + "]");
+                foreach (KeyValuePair<string, string> kvp in secPair.Value) {
+                    sb.AppendLine(kvp.Key + "=" + kvp.Value);
+                }
+                sb.AppendLine();
+            }
+            File.WriteAllText(path, sb.ToString());
+        } catch {
+            // Suppress IO errors
+        }
+    }
+
+    public static void ResetPosition(NotificationPosition position) {
+        try {
+            string path = GetConfigPath();
+            if (!File.Exists(path)) return;
+            string[] lines = File.ReadAllLines(path);
+            StringBuilder sb = new StringBuilder();
+            string currentSection = "";
+            string targetSection = "[" + position.ToString() + "]";
+
+            foreach (string rawLine in lines) {
+                string line = rawLine.Trim();
+                if (line.StartsWith("[") && line.EndsWith("]")) {
+                    currentSection = line;
+                    if (string.Equals(currentSection, targetSection, StringComparison.OrdinalIgnoreCase)) {
+                        continue;
+                    }
+                }
+                if (!string.Equals(currentSection, targetSection, StringComparison.OrdinalIgnoreCase)) {
+                    sb.AppendLine(rawLine);
+                }
+            }
+            File.WriteAllText(path, sb.ToString());
+        } catch {
+            // Suppress IO errors
+        }
+    }
+    #endregion
+
+    private static bool IsPointInRect(POINT pt, RECT rect) {
+        return pt.X >= rect.Left && pt.X <= rect.Right && pt.Y >= rect.Top && pt.Y <= rect.Bottom;
+    }
+
     /// <summary>
-    /// Repositions a target notification window to the top left, top center, or top right of its containing screen.
-    /// Supports multi-monitor environments and validates bounding rectangle.
+    /// Repositions a target notification window. Uses saved custom position if available,
+    /// or calculates target based on screen preset.
     /// </summary>
-    private static bool MoveNotification(IntPtr hwnd, NotificationPosition position, int yOffset, int xPadding) {
+    private static bool MoveNotification(IntPtr hwnd, NotificationPosition position, bool hasCustom, int customX, int customY, int yOffset, int xPadding) {
         if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) {
             return false;
         }
@@ -70,24 +230,28 @@ public class Program {
             return false;
         }
 
-        // Obtain the specific monitor containing this notification window (Multi-monitor support)
         Screen screen = Screen.FromHandle(hwnd);
         int targetX;
+        int targetY;
 
-        switch (position) {
-            case NotificationPosition.TopLeft:
-                targetX = screen.Bounds.Left + xPadding;
-                break;
-            case NotificationPosition.TopCenter:
-                targetX = screen.Bounds.Left + (screen.Bounds.Width - width) / 2;
-                break;
-            case NotificationPosition.TopRight:
-            default:
-                targetX = screen.Bounds.Right - width - xPadding;
-                break;
+        if (hasCustom) {
+            targetX = screen.Bounds.Left + customX;
+            targetY = screen.Bounds.Top + customY;
+        } else {
+            switch (position) {
+                case NotificationPosition.TopLeft:
+                    targetX = screen.Bounds.Left + xPadding;
+                    break;
+                case NotificationPosition.TopCenter:
+                    targetX = screen.Bounds.Left + (screen.Bounds.Width - width) / 2;
+                    break;
+                case NotificationPosition.TopRight:
+                default:
+                    targetX = screen.Bounds.Right - width - xPadding;
+                    break;
+            }
+            targetY = screen.Bounds.Top + yOffset;
         }
-
-        int targetY = screen.Bounds.Top + yOffset;
 
         SetWindowPos(hwnd, IntPtr.Zero, targetX, targetY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
         return true;
@@ -125,20 +289,37 @@ public class Program {
                 return; // Another instance is already active
             }
 
+            int customOffsetX = 0;
+            int customOffsetY = 0;
+            bool hasCustomPos = LoadPosition(position, out customOffsetX, out customOffsetY);
+
+            // Drag state variables
+            bool isDragging = false;
+            IntPtr draggingHwnd = IntPtr.Zero;
+            POINT dragStartCursor = new POINT();
+            POINT dragStartWindow = new POINT();
+
             while (true) {
                 bool hasActiveNotification = false;
 
-                // 1. MS Teams Notifications
+                // Check modifier key and mouse states for Drag & Drop / Reset
+                bool isAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                bool isLButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                bool isRButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+
+                IntPtr activeHwnd = IntPtr.Zero;
+
+                // 1. Locate MS Teams Notifications
+                IntPtr teamsHwnd = IntPtr.Zero;
                 try {
-                    IntPtr teamsHwnd = FindWindow("Chrome_WidgetWin_1", "Microsoft Teams Notification");
+                    teamsHwnd = FindWindow("Chrome_WidgetWin_1", "Microsoft Teams Notification");
                     if (teamsHwnd != IntPtr.Zero && IsWindow(teamsHwnd)) {
                         IntPtr chromeHwnd = FindWindowEx(teamsHwnd, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", "Chrome Legacy Window");
 
                         if (chromeHwnd != IntPtr.Zero) {
-                            if (MoveNotification(teamsHwnd, position, 15, 15)) {
-                                hasActiveNotification = true;
-                                Cooldown = 1;
-                            }
+                            activeHwnd = teamsHwnd;
+                            hasActiveNotification = true;
+                            Cooldown = 1;
                         } else if (Cooldown > 0) {
                             hasActiveNotification = true;
                             if (Cooldown >= 30) {
@@ -155,21 +336,76 @@ public class Program {
                     // Suppress external exceptions
                 }
 
-                // 2. Windows System Notifications (CoreWindow)
+                // 2. Locate Windows System Notifications (CoreWindow)
+                IntPtr sysHwnd = IntPtr.Zero;
                 try {
-                    IntPtr hwnd = FindWindow("Windows.UI.Core.CoreWindow", "New notification");
-                    if (hwnd != IntPtr.Zero && IsWindow(hwnd)) {
-                        // 37PX Y offset to make the spacing even (MyDockFinder friendly)
-                        if (MoveNotification(hwnd, position, -37, 0)) {
-                            hasActiveNotification = true;
-                        }
+                    sysHwnd = FindWindow("Windows.UI.Core.CoreWindow", "New notification");
+                    if (sysHwnd != IntPtr.Zero && IsWindow(sysHwnd)) {
+                        activeHwnd = sysHwnd;
+                        hasActiveNotification = true;
                     }
                 } catch {
                     // Suppress external exceptions
                 }
 
-                // Adaptive polling: 15ms during active display/animation, 100ms when idle
-                Thread.Sleep(hasActiveNotification ? 15 : 100);
+                // 3. Handle Drag & Drop / Reset Interactions
+                if (hasActiveNotification && activeHwnd != IntPtr.Zero) {
+                    POINT curPt;
+                    GetCursorPos(out curPt);
+
+                    RECT winRect = new RECT();
+                    GetWindowRect(activeHwnd, ref winRect);
+
+                    // Check Alt + Right Click: Reset custom position to default preset
+                    if (isAltDown && isRButtonDown && IsPointInRect(curPt, winRect)) {
+                        ResetPosition(position);
+                        hasCustomPos = false;
+                        isDragging = false;
+                        Thread.Sleep(200); // Debounce
+                    }
+                    // Check Alt + Left Click: Initiate Drag
+                    else if (!isDragging && isAltDown && isLButtonDown && IsPointInRect(curPt, winRect)) {
+                        isDragging = true;
+                        draggingHwnd = activeHwnd;
+                        dragStartCursor = curPt;
+                        dragStartWindow = new POINT { X = winRect.Left, Y = winRect.Top };
+                    }
+                }
+
+                // Execute Drag tracking if in dragging state
+                if (isDragging) {
+                    if (isLButtonDown && IsWindow(draggingHwnd)) {
+                        POINT curPt;
+                        GetCursorPos(out curPt);
+                        int newX = dragStartWindow.X + (curPt.X - dragStartCursor.X);
+                        int newY = dragStartWindow.Y + (curPt.Y - dragStartCursor.Y);
+                        SetWindowPos(draggingHwnd, IntPtr.Zero, newX, newY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
+                    } else {
+                        // User released mouse button: save new position
+                        isDragging = false;
+                        if (IsWindow(draggingHwnd)) {
+                            RECT finalRect = new RECT();
+                            if (GetWindowRect(draggingHwnd, ref finalRect)) {
+                                Screen screen = Screen.FromHandle(draggingHwnd);
+                                customOffsetX = finalRect.Left - screen.Bounds.Left;
+                                customOffsetY = finalRect.Top - screen.Bounds.Top;
+                                hasCustomPos = true;
+                                SavePosition(position, customOffsetX, customOffsetY);
+                            }
+                        }
+                    }
+                } else {
+                    // Normal positioning when not actively dragging
+                    if (teamsHwnd != IntPtr.Zero && Cooldown == 1) {
+                        MoveNotification(teamsHwnd, position, hasCustomPos, customOffsetX, customOffsetY, 15, 15);
+                    }
+                    if (sysHwnd != IntPtr.Zero) {
+                        MoveNotification(sysHwnd, position, hasCustomPos, customOffsetX, customOffsetY, -37, 0);
+                    }
+                }
+
+                // Adaptive polling: 10ms during drag, 15ms during active display, 100ms when idle
+                Thread.Sleep(isDragging ? 10 : (hasActiveNotification ? 15 : 100));
             }
         }
     }

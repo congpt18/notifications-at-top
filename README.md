@@ -1,14 +1,9 @@
-thanks to SamarthCat, i just modify the position so it just MyDockFinder friendly
+A forked from SamarthCat
 
 # Notifications At The Top Of The Screen
 Move windows 11 / 10 notifications to the top of the screen.  
-Update 1.1.0: Support For Microsoft Teams (Work, School, Personal) Notifications. Thanks [shankarnewton](https://github.com/shankarnewton) For The Suggestion.
-
-![image](https://user-images.githubusercontent.com/79756986/162231083-41700e52-afbe-4009-b85a-1be9db8ab6a0.png)
-
 
 # Usage
-- Download the latest release from [here](https://github.com/SamarthCat/notifications-at-top/releases/latest)
 
 - Run ``` topleft.exe ``` for the top left
 
@@ -17,6 +12,12 @@ Update 1.1.0: Support For Microsoft Teams (Work, School, Personal) Notifications
 - Run ``` topright.exe ``` for the top right
 
 - Add a shortcut to it in ``` %appdata%\Microsoft\Windows\Start Menu\Programs\Startup ``` if you want it to run on boot
+
+
+# Customization & Drag-and-Drop
+
+- **Drag & Drop:** Hold `Alt` and **Left Click & Drag** any notification to place it anywhere on screen. The new position will be automatically saved to `config.ini` for future notifications.
+- **Reset Position:** Hold `Alt` and **Right Click** the notification to reset it back to its original preset position (`topleft`, `topcenter`, or `topright`).
 
 
 # Compiling
