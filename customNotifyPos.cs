@@ -1,4 +1,4 @@
-​using System;
+using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Collections.Generic;
@@ -189,6 +189,9 @@ public class Program {
     [DllImport("user32.dll")]
     static extern bool DestroyWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
     [DllImport("user32.dll")]
     static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
@@ -268,21 +271,22 @@ public class Program {
     const uint OCR_NORMAL = 32512;
     const uint SPI_SETCURSORS = 0x0057;
 
+    const uint WM_PAINT = 0x000F;
+    const uint WM_CLOSE = 0x0010;
+    const uint WM_TIMER = 0x0113;
+    const uint WM_DESTROY = 0x0002;
+    const uint WM_LBUTTONDOWN = 0x0201;
+
     const int RESIZE_BORDER = 8;
     const string CONFIG_SECTION = "CustomNotifyPos";
     #endregion
 
-    public static int Cooldown = 0;
     private static IntPtr testNotifyHwnd = IntPtr.Zero;
     private static WndProcDelegate testWndProcHolder; // Prevents GC collection of delegate
     private static IntPtr cachedTeamsHwnd = IntPtr.Zero;
 
     #region Pure Win32 Startup Test Notification (Zero WinForms Overhead)
     private static IntPtr TestWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam) {
-        const uint WM_PAINT = 0x000F;
-        const uint WM_TIMER = 0x0113;
-        const uint WM_DESTROY = 0x0002;
-        const uint WM_LBUTTONDOWN = 0x0201;
         const int TRANSPARENT = 1;
         const uint DT_LEFT = 0x0000;
         const uint DT_TOP = 0x0000;
@@ -355,6 +359,10 @@ public class Program {
                 return IntPtr.Zero;
             }
         } else if (msg == WM_TIMER) {
+            KillTimer(hWnd, (IntPtr)1);
+            DestroyWindow(hWnd);
+            return IntPtr.Zero;
+        } else if (msg == WM_CLOSE) {
             KillTimer(hWnd, (IntPtr)1);
             DestroyWindow(hWnd);
             return IntPtr.Zero;
@@ -745,9 +753,10 @@ public class Program {
     /// </summary>
     private static void ResizeChildContent(IntPtr hwnd, int width, int height) {
         try {
+            StringBuilder sb = new StringBuilder(32);
             // Synchronously resize child render hosts across all nested levels (Teams Classic and Teams WebView2)
             EnumChildWindows(hwnd, delegate(IntPtr childHwnd, IntPtr lParam) {
-                StringBuilder sb = new StringBuilder(32);
+                sb.Length = 0;
                 GetClassName(childHwnd, sb, 32);
                 string cls = sb.ToString();
                 if (cls.StartsWith("Chrome_") || cls.StartsWith("Intermediate D3D")) {
@@ -849,7 +858,7 @@ public class Program {
     /// Repositions and resizes a target notification window. Uses saved custom position/size if available,
     /// or centers at the top of the monitor by default.
     /// </summary>
-    private static bool MoveNotification(IntPtr hwnd, bool hasCustom, int customX, int customY, bool hasCustomSize, int customW, int customH, int yOffset) {
+    private static bool MoveNotification(IntPtr hwnd, bool hasCustom, int customX, int customY, bool hasCustomSize, int customW, int customH, int yOffset, IntPtr sysHwnd) {
         try {
             if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) {
                 return false;
@@ -869,6 +878,11 @@ public class Program {
             }
 
             RECT screen = GetMonitorRect(hwnd);
+
+            // Ensure notification dimensions do not exceed current monitor dimensions
+            if (width > screen.Width) width = screen.Width;
+            if (height > screen.Height) height = screen.Height;
+
             int targetX;
             int targetY;
 
@@ -881,7 +895,22 @@ public class Program {
                 targetY = screen.Top + yOffset;
             }
 
-            if (targetY < screen.Top) targetY = screen.Top;
+            // Boundary clamping: ensure notification stays 100% visible on current screen resolution
+            if (targetX + width > screen.Right) {
+                targetX = screen.Right - width;
+            }
+            if (targetX < screen.Left) {
+                targetX = screen.Left;
+            }
+
+            if (targetY + height > screen.Bottom) {
+                targetY = screen.Bottom - height;
+            }
+            // Allow CoreWindow to respect negative top offset (-37px) due to its invisible border
+            int minY = (hwnd == sysHwnd || yOffset < 0) ? (screen.Top + yOffset) : screen.Top;
+            if (targetY < minY) {
+                targetY = minY;
+            }
 
             // Avoid redundant SetWindowPos calls if already at the target position/size
             if (rect.Left == targetX && rect.Top == targetY && (!hasCustomSize || (rect.Width == width && rect.Height == height))) {
@@ -952,6 +981,7 @@ public class Program {
                 bool isAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
                 bool isLButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
                 bool isRButtonDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+                bool isLButtonPressed = isLButtonDown && !wasLButtonDown;
 
                 // 1. Locate candidate notification windows
                 bool hasTest = (testNotifyHwnd != IntPtr.Zero && IsWindow(testNotifyHwnd));
@@ -959,11 +989,6 @@ public class Program {
                 IntPtr teamsHwnd = IntPtr.Zero;
                 try {
                     teamsHwnd = FindTeamsNotificationWindow();
-                    if (teamsHwnd != IntPtr.Zero && IsWindow(teamsHwnd)) {
-                        Cooldown = 1;
-                    } else if (Cooldown > 0) {
-                        Cooldown = 0;
-                    }
                 } catch {
                     // Suppress external exceptions
                 }
@@ -1026,12 +1051,22 @@ public class Program {
                             isDragging = false;
                             isResizing = false;
                             RestoreSystemCursor();
+
+                            // Immediately restore target window to default dimensions & position
+                            RECT screen = GetMonitorRect(hoverHwnd);
+                            int defW = 380;
+                            int defH = 110;
+                            int defX = screen.Left + (screen.Width - defW) / 2;
+                            int defY = screen.Top + (hoverHwnd == sysHwnd ? -37 : 15);
+                            SetWindowPos(hoverHwnd, IntPtr.Zero, defX, defY, defW, defH, SWP_NOZORDER | SWP_SHOWWINDOW);
+                            ResizeChildContent(hoverHwnd, defW, defH);
+
                             Thread.Sleep(200); // Debounce
                         } else {
                             ResizeEdge edge = GetResizeEdge(curPt, hoverRect, RESIZE_BORDER);
-                            if (edge != ResizeEdge.None) {
+                            if (edge != ResizeEdge.None && !isAltDown) {
                                 UpdateCursorForEdge(edge);
-                                if (isLButtonDown) {
+                                if (isLButtonPressed) {
                                     isResizing = true;
                                     resizingHwnd = hoverHwnd;
                                     activeResizeEdge = edge;
@@ -1043,14 +1078,12 @@ public class Program {
                                 // TestNotify can be dragged with plain Left Click or Alt+Left Click.
                                 // Real notifications (Teams, Windows) require Alt+Left Click.
                                 bool allowDrag = (hoverHwnd == testNotifyHwnd) || isAltDown;
-                                if (allowDrag && isLButtonDown) {
+                                if (allowDrag && isLButtonPressed) {
                                     // Check if clicked the [X] button on TestNotify (top-right 36x36 area)
                                     bool isCloseClick = (hoverHwnd == testNotifyHwnd) && 
                                                         (curPt.X >= hoverRect.Right - 36 && curPt.Y <= hoverRect.Top + 36);
                                     if (isCloseClick) {
-                                        KillTimer(testNotifyHwnd, (IntPtr)1);
-                                        DestroyWindow(testNotifyHwnd);
-                                        testNotifyHwnd = IntPtr.Zero;
+                                        PostMessage(testNotifyHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
                                     } else {
                                         isDragging = true;
                                         draggingHwnd = hoverHwnd;
@@ -1141,6 +1174,26 @@ public class Program {
                                 break;
                         }
 
+                        // Boundary clamp during resize to prevent pushing beyond screen
+                        RECT screen = GetMonitorRect(resizingHwnd);
+                        if (newX < screen.Left) {
+                            newWidth -= (screen.Left - newX);
+                            newX = screen.Left;
+                        }
+                        int resizeMinY = (resizingHwnd == sysHwnd) ? (screen.Top - 37) : screen.Top;
+                        if (newY < resizeMinY) {
+                            newHeight -= (resizeMinY - newY);
+                            newY = resizeMinY;
+                        }
+                        if (newX + newWidth > screen.Right) {
+                            newWidth = screen.Right - newX;
+                        }
+                        if (newY + newHeight > screen.Bottom) {
+                            newHeight = screen.Bottom - newY;
+                        }
+                        if (newWidth < MIN_WIDTH) newWidth = MIN_WIDTH;
+                        if (newHeight < MIN_HEIGHT) newHeight = MIN_HEIGHT;
+
                         SetWindowPos(resizingHwnd, IntPtr.Zero, newX, newY, newWidth, newHeight, SWP_NOZORDER | SWP_SHOWWINDOW);
                         ResizeChildContent(resizingHwnd, newWidth, newHeight);
                     } else {
@@ -1153,7 +1206,8 @@ public class Program {
                                 RECT screen = GetMonitorRect(resizingHwnd);
                                 customOffsetX = finalRect.Left - screen.Left;
                                 customOffsetY = finalRect.Top - screen.Top;
-                                if (customOffsetY < 0) customOffsetY = 0;
+                                int minSavedY = (resizingHwnd == sysHwnd) ? -37 : 0;
+                                if (customOffsetY < minSavedY) customOffsetY = minSavedY;
                                 customWidth = finalRect.Width;
                                 customHeight = finalRect.Height;
                                 hasCustomPos = true;
@@ -1169,6 +1223,23 @@ public class Program {
                     if (isLButtonDown && IsWindow(draggingHwnd)) {
                         int newX = dragStartWindow.X + (curPt.X - dragStartCursor.X);
                         int newY = dragStartWindow.Y + (curPt.Y - dragStartCursor.Y);
+
+                        RECT screen = GetMonitorRect(draggingHwnd);
+                        RECT curRect = new RECT();
+                        int curW = (hasCustomSize && customWidth > 50) ? customWidth : 380;
+                        int curH = (hasCustomSize && customHeight > 30) ? customHeight : 110;
+                        if (GetWindowRect(draggingHwnd, ref curRect)) {
+                            if (curRect.Width > 30) curW = curRect.Width;
+                            if (curRect.Height > 20) curH = curRect.Height;
+                        }
+
+                        // Prevent dragging off-screen
+                        if (newX + curW > screen.Right) newX = screen.Right - curW;
+                        if (newX < screen.Left) newX = screen.Left;
+                        if (newY + curH > screen.Bottom) newY = screen.Bottom - curH;
+                        int dragMinY = (draggingHwnd == sysHwnd) ? (screen.Top - 37) : screen.Top;
+                        if (newY < dragMinY) newY = dragMinY;
+
                         if (hasCustomSize && customWidth > 0 && customHeight > 0) {
                             SetWindowPos(draggingHwnd, IntPtr.Zero, newX, newY, customWidth, customHeight, SWP_NOZORDER | SWP_SHOWWINDOW);
                         } else {
@@ -1183,7 +1254,15 @@ public class Program {
                                 RECT screen = GetMonitorRect(draggingHwnd);
                                 customOffsetX = finalRect.Left - screen.Left;
                                 customOffsetY = finalRect.Top - screen.Top;
-                                if (customOffsetY < 0) customOffsetY = 0;
+                                int minSavedY = (draggingHwnd == sysHwnd) ? -37 : 0;
+                                if (customOffsetY < minSavedY) customOffsetY = minSavedY;
+                                if (customOffsetX < 0) customOffsetX = 0;
+                                if (customOffsetX + finalRect.Width > screen.Width) {
+                                    customOffsetX = screen.Width - finalRect.Width;
+                                }
+                                if (customOffsetY + finalRect.Height > screen.Height) {
+                                    customOffsetY = screen.Height - finalRect.Height;
+                                }
                                 hasCustomPos = true;
                                 SaveConfig(true, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight);
                             }
@@ -1193,13 +1272,13 @@ public class Program {
                 } else {
                     // Normal positioning when not actively dragging or resizing
                     if (hasTest && testNotifyHwnd != draggingHwnd && testNotifyHwnd != resizingHwnd) {
-                        MoveNotification(testNotifyHwnd, hasCustomPos, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight, 15);
+                        MoveNotification(testNotifyHwnd, hasCustomPos, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight, 15, sysHwnd);
                     }
-                    if (hasTeams && Cooldown == 1 && teamsHwnd != draggingHwnd && teamsHwnd != resizingHwnd) {
-                        MoveNotification(teamsHwnd, hasCustomPos, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight, 15);
+                    if (hasTeams && teamsHwnd != draggingHwnd && teamsHwnd != resizingHwnd) {
+                        MoveNotification(teamsHwnd, hasCustomPos, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight, 15, sysHwnd);
                     }
                     if (hasSys && sysHwnd != draggingHwnd && sysHwnd != resizingHwnd) {
-                        MoveNotification(sysHwnd, hasCustomPos, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight, -37);
+                        MoveNotification(sysHwnd, hasCustomPos, customOffsetX, customOffsetY, hasCustomSize, customWidth, customHeight, -37, sysHwnd);
                     }
                 }
 
